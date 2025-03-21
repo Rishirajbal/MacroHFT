@@ -101,9 +101,10 @@ class DQN(object):
         if not os.path.exists(self.model_path):
             os.makedirs(self.model_path)
 
-        self.tech_indicator_list = np.load('./data/feature_list/single_features.npy', allow_pickle=True).tolist()
-        self.tech_indicator_list_trend = np.load('./data/feature_list/trend_features.npy', allow_pickle=True).tolist()
-        self.clf_list = ['slope_360', 'vol_360']
+        # Update tech_indicator_list to match the new dataset
+        self.tech_indicator_list = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+        self.tech_indicator_list_trend = []  # Add trend features if needed
+        self.clf_list = []  # Add classification features if needed
 
         self.transcation_cost = args.transcation_cost
         self.back_time_length = args.back_time_length
