@@ -74,7 +74,7 @@ class DQN(object):
             self.device = torch.device("cpu")
         self.result_path = os.path.join("./result/high_level", '{}'.format(args.dataset), args.exp)
         self.model_path = os.path.join(self.result_path, "seed_{}".format(self.seed))
-        self.train_data_path = os.path.join(ROOT, "MacroHFT", "data", args.dataset, "whole")
+        self.train_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"  # Updated path
         self.val_data_path = os.path.join(ROOT, "MacroHFT", "data", args.dataset, "whole")
         self.test_data_path = os.path.join(ROOT, "MacroHFT", "data", args.dataset, "whole")
         self.dataset = args.dataset
@@ -299,7 +299,7 @@ class DQN(object):
         self.replay_buffer = ReplayBuffer_High(args, self.n_state_1, self.n_state_2, self.n_action)
         for sample in range(self.epoch_number):
             print('epoch ', epoch_counter + 1)
-            self.df = pd.read_csv(os.path.join(self.train_data_path, "df_train.csv"))
+            self.df = pd.read_csv("/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv")  # Updated path
 
             train_env = Training_Env(
                 df=self.df,
