@@ -77,9 +77,10 @@ class DQN(object):
             self.device = torch.device("cpu")
         self.result_path = os.path.join("./result/high_level", '{}'.format(args.dataset), args.exp)
         self.model_path = os.path.join(self.result_path, "seed_{}".format(self.seed))
-        self.train_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"  # Updated path
-        self.val_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"  # Updated path
-        self.test_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"  # Updated path
+        # Updated paths
+        self.train_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv'
+        self.val_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv'
+        self.test_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv'
         self.dataset = args.dataset
         self.num_step = args.num_step
         if "BTC" in self.dataset:
