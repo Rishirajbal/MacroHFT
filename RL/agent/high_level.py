@@ -337,8 +337,9 @@ class DQN(object):
         self.replay_buffer = ReplayBuffer_High(args, self.n_state_1, self.n_state_2, self.n_action) 
         for sample in range(self.epoch_number):
             print('epoch ', epoch_counter + 1)
-            self.df = pd.read_feather(
-                os.path.join(self.train_data_path, "train.feather"))
+          self.df = pd.read_csv(
+    os.path.join(self.train_data_path, "df_train.csv")
+
             
             
             train_env = Training_Env(
