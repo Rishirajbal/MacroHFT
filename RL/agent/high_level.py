@@ -11,6 +11,9 @@ import os
 import joblib
 from torch.utils.tensorboard import SummaryWriter
 import warnings
+import numpy as np
+import pandas as pd
+
 warnings.filterwarnings("ignore")
 
 ROOT = str(pathlib.Path(__file__).resolve().parents[3])
@@ -75,8 +78,8 @@ class DQN(object):
         self.result_path = os.path.join("./result/high_level", '{}'.format(args.dataset), args.exp)
         self.model_path = os.path.join(self.result_path, "seed_{}".format(self.seed))
         self.train_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"  # Updated path
-        self.val_data_path = os.path.join(ROOT, "MacroHFT", "data", args.dataset, "whole")
-        self.test_data_path = os.path.join(ROOT, "MacroHFT", "data", args.dataset, "whole")
+        self.val_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"  # Updated path
+        self.test_data_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"  # Updated path
         self.dataset = args.dataset
         self.num_step = args.num_step
         if "BTC" in self.dataset:
@@ -103,50 +106,34 @@ class DQN(object):
 
         # Update tech_indicator_list to match the new dataset
         self.tech_indicator_list = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-        self.tech_indicator_list_trend = []  # Add trend features if needed
-        self.clf_list = []  # Add classification features if needed
+        self.tech_indicator_list_trend = []  # No trend features in this dataset
+        self.clf_list = []  # No classification features in this dataset
 
         self.transcation_cost = args.transcation_cost
         self.back_time_length = args.back_time_length
         self.n_action = 2
-        self.n_state_1 = len(self.tech_indicator_list)
-        self.n_state_2 = len(self.tech_indicator_list_trend)
+        self.n_state_1 = len(self.tech_indicator_list)  # Number of features
+        self.n_state_2 = len(self.tech_indicator_list_trend)  # No trend features
+
+        # Initialize subagents
         self.slope_1 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
         self.slope_2 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
         self.slope_3 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
         self.vol_1 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
         self.vol_2 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
         self.vol_3 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        model_list_slope = [
-            "./result/low_level/ETHUSDT/best_model/slope/1/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/slope/2/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/slope/3/best_model.pkl"
-        ]
-        model_list_vol = [
-            "./result/low_level/ETHUSDT/best_model/vol/1/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/vol/2/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/vol/3/best_model.pkl"
-        ]
-        self.slope_1.load_state_dict(torch.load(model_list_slope[0], map_location=self.device))
-        self.slope_2.load_state_dict(torch.load(model_list_slope[1], map_location=self.device))
-        self.slope_3.load_state_dict(torch.load(model_list_slope[2], map_location=self.device))
-        self.vol_1.load_state_dict(torch.load(model_list_vol[0], map_location=self.device))
-        self.vol_2.load_state_dict(torch.load(model_list_vol[1], map_location=self.device))
-        self.vol_3.load_state_dict(torch.load(model_list_vol[2], map_location=self.device))
-        self.slope_1.eval()
-        self.slope_2.eval()
-        self.slope_3.eval()
-        self.vol_1.eval()
-        self.vol_2.eval()
-        self.vol_3.eval()
-        self.slope_agents = {0: self.slope_1, 1: self.slope_2, 2: self.slope_3}
-        self.vol_agents = {0: self.vol_1, 1: self.vol_2, 2: self.vol_3}
+
+        # Initialize hyperagent
         self.hyperagent = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
         self.hyperagent_target = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
         self.hyperagent_target.load_state_dict(self.hyperagent.state_dict())
+
+        # Initialize optimizer and loss function
         self.update_times = args.update_times
         self.optimizer = torch.optim.Adam(self.hyperagent.parameters(), lr=args.lr)
         self.loss_func = nn.MSELoss()
+
+        # Training parameters
         self.batch_size = args.batch_size
         self.gamma = args.gamma
         self.tau = args.tau
@@ -158,6 +145,8 @@ class DQN(object):
         self.decay_length = args.decay_length
         self.epsilon_scheduler = LinearDecaySchedule(start_epsilon=self.epsilon_start, end_epsilon=self.epsilon_end, decay_length=self.decay_length)
         self.epsilon = args.epsilon_start
+
+        # Initialize memory
         self.memory = episodicmemory(4320, 5, self.n_state_1, self.n_state_2, 64, self.device)
 
     def calculate_q(self, w, qs):
@@ -300,7 +289,7 @@ class DQN(object):
         self.replay_buffer = ReplayBuffer_High(args, self.n_state_1, self.n_state_2, self.n_action)
         for sample in range(self.epoch_number):
             print('epoch ', epoch_counter + 1)
-            self.df = pd.read_csv("/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv")  # Updated path
+            self.df = pd.read_csv(self.train_data_path)  # Load training data
 
             train_env = Training_Env(
                 df=self.df,
@@ -392,7 +381,7 @@ class DQN(object):
         final_balance_list = []
         required_money_list = []
         commission_fee_list = []
-        self.df = pd.read_feather(os.path.join(self.val_data_path, "val.feather"))
+        self.df = pd.read_csv(self.val_data_path)  # Load validation data
 
         val_env = Testing_Env(
             df=self.df,
@@ -442,7 +431,7 @@ class DQN(object):
         final_balance_list = []
         required_money_list = []
         commission_fee_list = []
-        self.df = pd.read_feather(os.path.join(self.test_data_path, "test.feather"))
+        self.df = pd.read_csv(self.test_data_path)  # Load test data
 
         test_env = Testing_Env(
             df=self.df,
