@@ -117,12 +117,16 @@ class DQN(object):
         self.n_state_2 = len(self.tech_indicator_list_trend)  # No trend features
 
         # Initialize subagents
-        self.slope_1 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.slope_2 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.slope_3 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_1 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_2 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_3 = subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
+        self.slope_agents = [
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
+        ]
+        self.vol_agents = [
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
+        ]
 
         # Initialize hyperagent
         self.hyperagent = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
@@ -418,63 +422,4 @@ class DQN(object):
         np.save(os.path.join(save_path, "action_val.npy"), action_list)
         np.save(os.path.join(save_path, "reward_val.npy"), reward_list)
         np.save(os.path.join(save_path, "final_balance_val.npy"), final_balance_list)
-        np.save(os.path.join(save_path, "require_money_val.npy"), required_money_list)
-        np.save(os.path.join(save_path, "commission_fee_history_val.npy"), commission_fee_list)
-        return_rate = final_balance / required_money
-        return return_rate
-
-    def test_cluster(self, epoch_path, save_path):
-        self.hyperagent.load_state_dict(torch.load(os.path.join(epoch_path, "trained_model.pkl")))
-        self.hyperagent.eval()
-        counter = False
-        action_list = []
-        reward_list = []
-        final_balance_list = []
-        required_money_list = []
-        commission_fee_list = []
-        self.df = pd.read_csv(self.test_data_path)  # Load test data
-
-        test_env = Testing_Env(
-            df=self.df,
-            tech_indicator_list=self.tech_indicator_list,
-            tech_indicator_list_trend=self.tech_indicator_list_trend,
-            clf_list=self.clf_list,
-            transcation_cost=self.transcation_cost,
-            back_time_length=self.back_time_length,
-            max_holding_number=self.max_holding_number,
-            initial_action=0)
-        s, s2, s3, info = test_env.reset()
-        done = False
-        action_list_episode = []
-        reward_list_episode = []
-        while not done:
-            a = self.act_test(s, s2, s3, info)
-            s_, s2_, s3_, r, done, info_ = test_env.step(a)
-            reward_list_episode.append(r)
-            s, s2, s3, info = s_, s2_, s3_, info_
-            action_list_episode.append(a)
-        portfit_magine, final_balance, required_money, commission_fee = test_env.get_final_return_rate(slient=True)
-        final_balance = test_env.final_balance
-        action_list.append(action_list_episode)
-        reward_list.append(reward_list_episode)
-        final_balance_list.append(final_balance)
-        required_money_list.append(required_money)
-        commission_fee_list.append(commission_fee)
-
-        action_list = np.array(action_list)
-        reward_list = np.array(reward_list)
-        final_balance_list = np.array(final_balance_list)
-        required_money_list = np.array(required_money_list)
-        commission_fee_list = np.array(commission_fee_list)
-        np.save(os.path.join(save_path, "action.npy"), action_list)
-        np.save(os.path.join(save_path, "reward.npy"), reward_list)
-        np.save(os.path.join(save_path, "final_balance.npy"), final_balance_list)
-        np.save(os.path.join(save_path, "require_money.npy"), required_money_list)
-        np.save(os.path.join(save_path, "commission_fee_history.npy"), commission_fee_list)
-
-
-if __name__ == "__main__":
-    args = parser.parse_args()
-    print(args)
-    agent = DQN(args)
-    agent.train()
+        np.save(os.path.join(save_path, "require_money_val.npy"), required
