@@ -21,7 +21,6 @@ tech_indicator_list = np.load('./data/feature_list/single_features.npy', allow_p
 tech_indicator_list_trend = np.load('./data/feature_list/trend_features.npy', allow_pickle=True).tolist()
 clf_list = ['slope_360', 'vol_360']
 
-
 transcation_cost = 0.0002
 back_time_length = 1
 max_holding_number = 0.01
@@ -42,14 +41,14 @@ class Testing_Env(gym.Env):
     ):
         self.tech_indicator_list = tech_indicator_list
         self.tech_indicator_list_trend = tech_indicator_list_trend
-        self.clf_list=clf_list
+        self.clf_list = clf_list
         self.df = df
         self.initial_action = initial_action
         self.action_space = spaces.Discrete(2)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=+np.inf,
-            shape=(back_time_length * len(self.tech_indicator_list), ))
+            shape=(back_time_length * len(self.tech_indicator_list), )
         self.terminal = False
         self.stack_length = back_time_length
         self.m = back_time_length
@@ -67,10 +66,9 @@ class Testing_Env(gym.Env):
         self.previous_position = 0
         self.position = 0
 
-
-
     def calculate_value(self, price_information, position):
-        return price_information["close"] * position
+        # Use 'Close' instead of 'close'
+        return price_information["Close"] * position
 
     def reset(self):
         self.terminal = False
@@ -111,8 +109,9 @@ class Testing_Env(gym.Env):
         if previous_position >= position:
             self.sell_size = previous_position - position
 
-            cash = self.sell_size * previous_price_information['close'] * (1 - self.comission_fee)
-            self.comission_fee_history.append(self.comission_fee * self.sell_size * previous_price_information['close'])
+            # Use 'Close' instead of 'close'
+            cash = self.sell_size * previous_price_information['Close'] * (1 - self.comission_fee)
+            self.comission_fee_history.append(self.comission_fee * self.sell_size * previous_price_information['Close'])
 
             self.sell_money_memory.append(cash)
             self.needed_money_memory.append(0)
@@ -132,8 +131,10 @@ class Testing_Env(gym.Env):
 
         if previous_position < position:
             self.buy_size = position - previous_position
-            needed_cash = self.buy_size * previous_price_information['close'] * (1 + self.comission_fee)
-            self.comission_fee_history.append(self.comission_fee * self.buy_size * previous_price_information['close'])
+
+            # Use 'Close' instead of 'close'
+            needed_cash = self.buy_size * previous_price_information['Close'] * (1 + self.comission_fee)
+            self.comission_fee_history.append(self.comission_fee * self.buy_size * previous_price_information['Close'])
 
             self.needed_money_memory.append(needed_cash)
             self.sell_money_memory.append(0)
@@ -188,7 +189,7 @@ class Training_Env(Testing_Env):
         transcation_cost=transcation_cost,
         back_time_length=back_time_length,
         max_holding_number=max_holding_number,
-        initial_action = 0,
+        initial_action=0,
         alpha=alpha,
     ):
         super(Training_Env,
@@ -203,7 +204,6 @@ class Training_Env(Testing_Env):
                                            max_punish=1e12)
         self.initial_action = initial_action
 
-
     def reset(self):
         single_state, trend_state, clf_state, info = super(Training_Env, self).reset()
         self.previous_action = self.initial_action
@@ -216,5 +216,3 @@ class Training_Env(Testing_Env):
         single_state, trend_state, clf_state, reward, done, info = super(Training_Env, self).step(action)
         info['q_value'] = self.q_table[self.m - 1][action][:]
         return single_state, trend_state, clf_state.reshape(-1), reward, done, info
-
-
