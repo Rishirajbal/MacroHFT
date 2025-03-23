@@ -48,7 +48,8 @@ class Testing_Env(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=+np.inf,
-            shape=(back_time_length * len(self.tech_indicator_list), )
+            shape=(back_time_length * len(self.tech_indicator_list), )  # Fixed: Added closing parenthesis
+        )
         self.terminal = False
         self.stack_length = back_time_length
         self.m = back_time_length
