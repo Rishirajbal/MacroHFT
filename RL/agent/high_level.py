@@ -27,7 +27,7 @@ from MacroHFT.RL.util.replay_buffer import ReplayBuffer_High
 from MacroHFT.RL.util.memory import episodicmemory
 
 os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADs"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["F_ENABLE_ONEDNN_OPTS"] = "0"
 
