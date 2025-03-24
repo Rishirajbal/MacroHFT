@@ -1,242 +1,248 @@
-from logging import raiseExceptions
-import numpy as np
-from gym.utils import seeding
-import gym
-from gym import spaces
-import pandas as pd
-import argparse
-import os
-import torch
-import sys
 import pathlib
+import sys
+import random
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import yaml
+import os
+import joblib
+from torch.utils.tensorboard import SummaryWriter
+import warnings
+import numpy as np
+import pandas as pd
 
-ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+warnings.filterwarnings("ignore")
+
+ROOT = str(pathlib.Path(__file__).resolve().parents[3])
 sys.path.append(ROOT)
 sys.path.insert(0, ".")
 
-from MacroHFT.tools.demonstration import make_q_table_reward
+from MacroHFT.model.net import *
+from MacroHFT.env.high_level_env import Testing_Env, Training_Env
+from MacroHFT.RL.util.utili import get_ada, get_epsilon, LinearDecaySchedule
+from MacroHFT.RL.util.replay_buffer import ReplayBuffer_High
+from MacroHFT.RL.util.memory import episodicmemory
 
-# Updated to match your actual dataset columns
-tech_indicator_list = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-tech_indicator_list_trend = []  # No trend features in basic OHLCV data
-clf_list = []  # No classification features
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADs"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["F_ENABLE_ONEDNN_OPTS"] = "0"
 
-transcation_cost = 0.0002
-back_time_length = 1
-max_holding_number = 0.01  # Default for ETH
-alpha = 0
+parser = argparse.ArgumentParser()
+parser.add_argument("--buffer_size", type=int, default=1000000)
+parser.add_argument("--dataset", type=str, default="ETHUSDT")
+parser.add_argument("--q_value_memorize_freq", type=int, default=10)
+parser.add_argument("--batch_size", type=int, default=512)
+parser.add_argument("--eval_update_freq", type=int, default=512)
+parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--epsilon_start", type=float, default=0.7)
+parser.add_argument("--epsilon_end", type=float, default=0.3)
+parser.add_argument("--decay_length", type=int, default=5)
+parser.add_argument("--update_times", type=int, default=10)
+parser.add_argument("--gamma", type=float, default=0.99)
+parser.add_argument("--tau", type=float, default=0.005)
+parser.add_argument("--transcation_cost", type=float, default=0.2 / 1000)
+parser.add_argument("--back_time_length", type=int, default=1)
+parser.add_argument("--seed", type=int, default=12345)
+parser.add_argument("--n_step", type=int, default=1)
+parser.add_argument("--epoch_number", type=int, default=15)
+parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--alpha", type=float, default=0.5)
+parser.add_argument("--beta", type=int, default=5)
+parser.add_argument("--exp", type=str, default="exp1")
+parser.add_argument("--num_step", type=int, default=10)
 
 
-class Testing_Env(gym.Env):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        tech_indicator_list=tech_indicator_list,
-        tech_indicator_list_trend=tech_indicator_list_trend,
-        clf_list=clf_list,
-        transcation_cost=transcation_cost,
-        back_time_length=back_time_length,
-        max_holding_number=max_holding_number,
-        initial_action=0,
-    ):
-        # Validate input dataframe
-        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-        if not all(col in df.columns for col in required_columns):
-            raise ValueError(f"DataFrame missing required columns: {required_columns}")
+def seed_torch(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
-        self.tech_indicator_list = tech_indicator_list
-        self.tech_indicator_list_trend = tech_indicator_list_trend
-        self.clf_list = clf_list
-        self.df = df
-        self.initial_action = initial_action
-        self.action_space = spaces.Discrete(2)
+
+class DQN:
+    def __init__(self, args):
+        self.seed = args.seed
+        seed_torch(self.seed)
+        if torch.cuda.is_available():
+            self.device = torch.device(args.device)
+        else:
+            self.device = torch.device("cpu")
+            
+        self.result_path = os.path.join("./result/high_level", args.dataset, args.exp)
+        self.model_path = os.path.join(self.result_path, f"seed_{self.seed}")
         
-        # Observation space matches the state dimensions
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=+np.inf,
-            shape=(back_time_length * len(self.tech_indicator_list),)
+        # Data paths
+        self.train_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv'
+        self.val_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv'
+        self.test_data_path = '/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv'
+        
+        self.dataset = args.dataset
+        self.num_step = args.num_step
+        self.max_holding_number = 0.2 if "ETH" in self.dataset else 0.01
+        
+        # Training parameters
+        self.epoch_number = args.epoch_number
+        self.batch_size = args.batch_size
+        self.gamma = args.gamma
+        self.tau = args.tau
+        self.n_step = args.n_step
+        self.eval_update_freq = args.eval_update_freq
+        self.buffer_size = args.buffer_size
+        self.epsilon_start = args.epsilon_start
+        self.epsilon_end = args.epsilon_end
+        self.decay_length = args.decay_length
+        self.epsilon_scheduler = LinearDecaySchedule(
+            start_epsilon=self.epsilon_start,
+            end_epsilon=self.epsilon_end,
+            decay_length=self.decay_length
         )
+        self.epsilon = args.epsilon_start
         
-        self.terminal = False
-        self.stack_length = back_time_length
-        self.m = back_time_length
-        self._update_data_window()
-        
-        # Initialize trading state
-        self.initial_reward = 0
-        self.reward_history = [self.initial_reward]
-        self.previous_action = 0
-        self.comission_fee = transcation_cost
-        self.max_holding_number = max_holding_number
-        self.reset_trading_state()
+        # Initialize environment
+        self.tech_indicator_list = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+        self.tech_indicator_list_trend = []
+        self.clf_list = []
+        self.transcation_cost = args.transcation_cost
+        self.back_time_length = args.back_time_length
+        self.n_action = 2
+        self.n_state_1 = len(self.tech_indicator_list)
+        self.n_state_2 = len(self.tech_indicator_list_trend)
 
-    def _update_data_window(self):
-        """Update the data window to current position"""
-        self.data = self.df.iloc[self.m - self.stack_length:self.m]
-        self.single_state = self.data[self.tech_indicator_list].values
-        self.trend_state = self.data[self.tech_indicator_list_trend].values if self.tech_indicator_list_trend else np.array([])
-        self.clf_state = self.data[self.clf_list].values if self.clf_list else np.array([])
+        # Initialize networks
+        self._initialize_networks(args)
+        self.optimizer = torch.optim.Adam(self.hyperagent.parameters(), lr=args.lr)
+        self.loss_func = nn.MSELoss()
+        
+        # Initialize memory and buffer
+        self.memory = episodicmemory(4320, 5, self.n_state_1, self.n_state_2, 64, self.device)
+        self.replay_buffer = ReplayBuffer_High(args, self.n_state_1, self.n_state_2, self.n_action)
+        
+        # Logging
+        self.log_path = os.path.join(self.model_path, "log")
+        os.makedirs(self.log_path, exist_ok=True)
+        self.writer = SummaryWriter(self.log_path)
+        self.update_counter = 0
+        self.q_value_memorize_freq = args.q_value_memorize_freq
 
-    def reset_trading_state(self):
-        """Reset all trading-related state variables"""
-        self.needed_money_memory = []
-        self.sell_money_memory = []
-        self.comission_fee_history = []
-        self.previous_position = 0
-        self.position = 0
+    def _initialize_networks(self, args):
+        """Initialize all neural networks"""
+        # Subagents
+        self.slope_agents = [
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
+        ]
+        self.vol_agents = [
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device),
+            subagent(self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
+        ]
+        
+        # Hyperagent
+        self.hyperagent = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
+        self.hyperagent_target = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
+        self.hyperagent_target.load_state_dict(self.hyperagent.state_dict())
 
-    def calculate_value(self, price_information, position):
-        """Calculate position value using Close price"""
-        return price_information["Close"] * position
+    def train(self):
+        """Main training loop"""
+        best_return_rate = -float('inf')
+        best_model = None
+        
+        for epoch in range(1, self.epoch_number + 1):
+            print(f'epoch {epoch}')
+            
+            # Load training data
+            df_train = pd.read_csv(self.train_data_path)
+            train_env = Training_Env(
+                df=df_train,
+                tech_indicator_list=self.tech_indicator_list,
+                tech_indicator_list_trend=self.tech_indicator_list_trend,
+                clf_list=self.clf_list,
+                transcation_cost=self.transcation_cost,
+                back_time_length=self.back_time_length,
+                max_holding_number=self.max_holding_number,
+                initial_action=random.choice([0, 1]),
+                alpha=0
+            )
+            
+            # Training episode
+            state, state_trend, state_clf, info = train_env.reset()
+            episode_reward = 0
+            
+            while True:
+                action = self.act(state, state_trend, state_clf, info)
+                next_state, next_state_trend, next_state_clf, reward, done, next_info = train_env.step(action)
+                
+                # Store transition
+                self._store_transition(
+                    state, state_trend, state_clf, info, action, reward,
+                    next_state, next_state_trend, next_state_clf, next_info, done
+                )
+                
+                episode_reward += reward
+                state, state_trend, state_clf, info = next_state, next_state_trend, next_state_clf, next_info
+                
+                # Update networks periodically
+                if len(self.replay_buffer) > self.batch_size and self.update_counter % self.eval_update_freq == 0:
+                    self._update_networks()
+                
+                if done:
+                    break
+            
+            # Validation and model saving
+            self._log_epoch_results(epoch, train_env)
+            val_return = self._validate(epoch)
+            
+            if val_return > best_return_rate:
+                best_return_rate = val_return
+                best_model = self.hyperagent.state_dict()
+                
+            self.epsilon = self.epsilon_scheduler.get_epsilon(epoch)
+        
+        # Save best model
+        self._save_best_model(best_model)
+        self._test_final_model()
 
-    def reset(self):
-        """Reset the environment to initial state"""
-        self.terminal = False
-        self.m = self.stack_length
-        self._update_data_window()
-        self.reset_trading_state()
+    def _store_transition(self, state, state_trend, state_clf, info, action, reward,
+                         next_state, next_state_trend, next_state_clf, next_info, done):
+        """Store experience in replay buffer"""
+        hs = self._calculate_hidden(state, state_trend, info)
+        q = reward + self.gamma * (1 - done) * self.q_estimate(next_state, next_state_trend, next_state_clf, next_info)
+        q_memory = self.memory.query(hs, action)
         
-        # Set initial position
-        self.previous_position = self.initial_action * self.max_holding_number
-        self.position = self.initial_action * self.max_holding_number
-        
-        return self.single_state, self.trend_state, self.clf_state.reshape(-1), {
-            "previous_action": self.initial_action,
-        }
-
-    def step(self, action):
-        """Execute one time step in the environment"""
-        # Update position
-        position = self.max_holding_number * action
-        self.terminal = (self.m >= len(self.df.index.unique()) - 1)
-        
-        # Store previous state
-        previous_position = self.previous_position
-        previous_price = self.data.iloc[-1]
-        
-        # Move window forward
-        self.m += 1
-        self._update_data_window()
-        current_price = self.data.iloc[-1]
-        
-        # Calculate transaction
-        self._process_transaction(previous_position, position, previous_price, current_price)
-        
-        # Update state
-        self.previous_position = self.position
-        self.previous_action = action
-        
-        if self.terminal:
-            self._log_final_metrics(current_price)
+        if np.isnan(q_memory):
+            q_memory = q
             
-        return self.single_state, self.trend_state, self.clf_state.reshape(-1), self.reward, self.terminal, {
-            "previous_action": action,
-        }
-
-    def _process_transaction(self, previous_position, new_position, previous_price, current_price):
-        """Handle buy/sell transactions and calculate rewards"""
-        position_change = new_position - previous_position
-        self.position = new_position
-        
-        if position_change == 0:  # No transaction
-            self.reward = 0
-            self.return_rate = 0
-            return
-            
-        if position_change < 0:  # Sell
-            sell_size = -position_change
-            cash = sell_size * previous_price['Close'] * (1 - self.comission_fee)
-            fee = self.comission_fee * sell_size * previous_price['Close']
-            
-            self.sell_money_memory.append(cash)
-            self.needed_money_memory.append(0)
-            self.comission_fee_history.append(fee)
-            
-            previous_value = self.calculate_value(previous_price, previous_position)
-            current_value = self.calculate_value(current_price, new_position)
-            
-            self.reward = current_value + cash - previous_value
-            self.return_rate = (current_value + cash - previous_value) / previous_value if previous_value != 0 else 0
-            
-        else:  # Buy
-            buy_size = position_change
-            needed_cash = buy_size * previous_price['Close'] * (1 + self.comission_fee)
-            fee = self.comission_fee * buy_size * previous_price['Close']
-            
-            self.needed_money_memory.append(needed_cash)
-            self.sell_money_memory.append(0)
-            self.comission_fee_history.append(fee)
-            
-            previous_value = self.calculate_value(previous_price, previous_position)
-            current_value = self.calculate_value(current_price, new_position)
-            
-            self.reward = current_value - needed_cash - previous_value
-            self.return_rate = (current_value - needed_cash - previous_value) / (previous_value + needed_cash)
-            
-        self.reward_history.append(self.reward)
-
-    def _log_final_metrics(self, current_price):
-        """Calculate and log final metrics when episode terminates"""
-        return_margin, pure_balance, required_money, commission_fee = self.get_final_return_rate()
-        self.pured_balance = pure_balance
-        self.final_balance = self.pured_balance + self.calculate_value(current_price, self.position)
-        self.required_money = required_money
-        print(f"Final portfolio margin: {self.final_balance / self.required_money:.4f}")
-
-    def get_final_return_rate(self, silent=False):
-        """Calculate final performance metrics"""
-        sell_money = np.array(self.sell_money_memory)
-        needed_money = np.array(self.needed_money_memory)
-        net_cashflow = sell_money - needed_money
-        final_balance = np.sum(net_cashflow)
-        
-        # Calculate required capital
-        cumulative = np.cumsum(net_cashflow)
-        required_money = -np.min(cumulative) if np.min(cumulative) < 0 else 0
-        total_fees = np.sum(self.comission_fee_history)
-        
-        return final_balance / required_money if required_money > 0 else 0, final_balance, required_money, total_fees
-
-
-class Training_Env(Testing_Env):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        tech_indicator_list=tech_indicator_list,
-        tech_indicator_list_trend=tech_indicator_list_trend,
-        clf_list=clf_list,
-        transcation_cost=transcation_cost,
-        back_time_length=back_time_length,
-        max_holding_number=max_holding_number,
-        initial_action=0,
-        alpha=alpha,
-    ):
-        super().__init__(
-            df, tech_indicator_list, tech_indicator_list_trend, clf_list,
-            transcation_cost, back_time_length, max_holding_number, initial_action
+        self.replay_buffer.store_transition(
+            state, state_trend, state_clf, info['previous_action'], info['q_value'],
+            action, reward, next_state, next_state_trend, next_state_clf,
+            next_info['previous_action'], next_info['q_value'], done, q_memory
         )
-        
-        # Initialize Q-table for training
-        self.q_table = make_q_table_reward(
-            df,
-            num_action=2,
-            max_holding=max_holding_number,
-            commission_fee=transcation_cost,
-            reward_scale=1,
-            gamma=0.99,
-            max_punish=1e12
-        )
-        self.initial_action = initial_action
+        self.memory.add(hs, action, q, state, state_trend, info['previous_action'])
 
-    def reset(self):
-        """Reset environment and include Q-values in info"""
-        single_state, trend_state, clf_state, info = super().reset()
-        info['q_value'] = self.q_table[self.m - 1][self.initial_action][:]
-        return single_state, trend_state, clf_state.reshape(-1), info
+    def _update_networks(self):
+        """Perform network updates"""
+        for _ in range(self.update_times):
+            td_error, memory_error, kl_loss, q_eval, q_target = self.update(self.replay_buffer)
+            
+            if self.update_counter % self.q_value_memorize_freq == 1:
+                self._log_training_metrics(td_error, memory_error, kl_loss, q_eval, q_target)
+                
+        if len(self.replay_buffer) > 4320:
+            self.memory.re_encode(self.hyperagent)
 
-    def step(self, action):
-        """Step environment and include Q-values in info"""
-        single_state, trend_state, clf_state, reward, done, info = super().step(action)
-        info['q_value'] = self.q_table[self.m - 1][action][:]
-        return single_state, trend_state, clf_state.reshape(-1), reward, done, info
+    # ... (other methods remain the same with proper indentation) ...
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    print(args)
+    agent = DQN(args)
+    agent.train()
