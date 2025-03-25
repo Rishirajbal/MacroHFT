@@ -18,12 +18,12 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 class Config:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = 42
-    lr = 0.001
+    lr = 0.0001  # Reduced learning rate
     batch_size = 64
     gamma = 0.99
     epsilon_start = 1.0
     epsilon_end = 0.01
-    epsilon_decay = 0.995
+    epsilon_decay = 0.999  # Slower epsilon decay
     target_update = 10
     memory_size = 10000
     num_episodes = 500
@@ -33,9 +33,9 @@ class Config:
     val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
     test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
     
-    # Dataset limitation (set to None for full dataset)
-    max_train_rows = 100000  # Reduced dataset size for testing
-    max_val_rows = 20000
+    # Dataset limitation
+    max_train_rows = 10000  # Smaller dataset for testing
+    max_val_rows = 2000
     
     tech_indicators = ['Open', 'High', 'Low', 'Close', 'Volume']
 
@@ -50,8 +50,10 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),  # Added batch norm
             nn.ReLU(),
             nn.Linear(128, 128),
+            nn.BatchNorm1d(128),  # Added batch norm
             nn.ReLU(),
             nn.Linear(128, output_dim)
         )
@@ -66,9 +68,14 @@ class TradingEnv:
         print("Debug: Initializing environment...")
         print(f"Raw data shape: {df.shape}")
         
-        # Data preprocessing
+        # Data preprocessing with validation
         self.df = df[Config.tech_indicators].copy()
         self.df = self.df.apply(pd.to_numeric, errors='coerce').dropna()
+        
+        # Data validation
+        assert not self.df.isnull().values.any(), "NaN values detected in data"
+        assert (self.df['Close'] > 0).all(), "Zero/negative prices found"
+        
         print(f"Clean data shape: {self.df.shape}")
         print("Sample data points:")
         print(self.df.head(2))
@@ -98,19 +105,21 @@ class TradingEnv:
         current_price = self.df.iloc[self.current_step]['Close']
         next_price = self.df.iloc[self.current_step + 1]['Close']
         
-        # Execute action
+        # Execute action with safeguards
         if action == 1 and self.holding == 0:
-            cost = current_price * (1 + self.transaction_cost)
-            self.holding = self.balance / cost
+            cost = max(current_price * (1 + self.transaction_cost), 1e-6)
+            self.holding = min(self.balance / cost, 1e6)  # Prevent extreme values
             self.balance = 0
         
         elif action == 0 and self.holding > 0:
-            self.balance = self.holding * current_price * (1 - self.transaction_cost)
+            proceeds = max(self.holding * current_price * (1 - self.transaction_cost), 0)
+            self.balance = proceeds
             self.holding = 0
         
-        # Update portfolio
-        new_value = self.balance + (self.holding * next_price)
-        reward = np.log(new_value / self.portfolio_value[-1]) if self.portfolio_value[-1] > 0 else 0
+        # Calculate reward with numerical safeguards
+        new_value = max(self.balance + (self.holding * next_price), 1e-6)
+        prev_value = max(self.portfolio_value[-1], 1e-6)
+        reward = np.clip(np.log(new_value / prev_value), -10, 10)  # Clipped reward
         self.portfolio_value.append(new_value)
         
         self.current_step += 1
@@ -160,7 +169,7 @@ class DQNAgent:
         loss = self.loss_fn(current_q.squeeze(), target_q)
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)  # Changed to grad_norm
         self.optimizer.step()
         
         self.epsilon = max(Config.epsilon_end, 
@@ -172,18 +181,22 @@ class DQNAgent:
 
 # ====================== Training Loop ======================
 def train():
+    # Clean previous runs
+    for f in ['best_model.pth', 'interrupted_model.pth', 'training_results.png']:
+        if os.path.exists(f):
+            os.remove(f)
+    
     print("="*50)
     print("Starting training process...")
     print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*50 + "\n")
     
-    # Load and limit data
-    print("Loading training data...")
     try:
+        # Load and limit data
+        print("Loading training data...")
         train_df = pd.read_csv(Config.train_path)
         val_df = pd.read_csv(Config.val_path)
         
-        # Apply dataset limitation
         if Config.max_train_rows:
             train_df = train_df.iloc[:Config.max_train_rows]
         if Config.max_val_rows:
@@ -192,101 +205,110 @@ def train():
         print(f"Using LIMITED dataset: Train {len(train_df)} rows, Val {len(val_df)} rows")
         print("\nTraining data sample:")
         print(train_df.head(2))
+        
+        # Initialize components
+        print("\nInitializing environment and agent...")
+        env = TradingEnv(train_df)
+        agent = DQNAgent(input_dim=len(Config.tech_indicators), output_dim=2)
+        
+        best_val_return = -np.inf
+        returns = []
+        losses = []
+        
+        print("\n" + "="*50)
+        print("Beginning training loop...")
+        print(f"Total episodes: {Config.num_episodes}")
+        print("="*50 + "\n")
+        
+        for episode in range(Config.num_episodes):
+            try:
+                state = env.reset()
+                done = False
+                total_reward = 0
+                episode_loss = 0
+                update_count = 0
+                
+                while not done:
+                    action = agent.select_action(state)
+                    next_state, reward, done, _ = env.step(action)
+                    agent.store_transition(state, action, reward, next_state, done)
+                    
+                    loss = agent.update_model()
+                    if loss > 0:
+                        episode_loss += loss
+                        update_count += 1
+                    
+                    state = next_state
+                    total_reward += reward
+                
+                avg_loss = episode_loss / max(update_count, 1)
+                
+                # Validation
+                val_env = TradingEnv(val_df)
+                val_state = val_env.reset()
+                val_done = False
+                val_return = 0
+                
+                with torch.no_grad():
+                    while not val_done:
+                        val_action = agent.policy_net(val_state).argmax().item()
+                        val_state, val_reward, val_done, _ = val_env.step(val_action)
+                        val_return += val_reward
+                
+                returns.append(val_return)
+                losses.append(avg_loss)
+                
+                if val_return > best_val_return:
+                    best_val_return = val_return
+                    torch.save(agent.policy_net.state_dict(), "best_model.pth")
+                
+                if episode % Config.target_update == 0:
+                    agent.update_target()
+                
+                print(f"Episode {episode+1:03d}/{Config.num_episodes} | "
+                      f"Train: {total_reward:+.2f} | "
+                      f"Val: {val_return:+.2f} | "
+                      f"ε: {agent.epsilon:.3f} | "
+                      f"Loss: {avg_loss:.4f} | "
+                      f"Steps: {env.current_step}")
+                
+            except KeyboardInterrupt:
+                print("\nTraining interrupted! Saving current model...")
+                torch.save(agent.policy_net.state_dict(), "interrupted_model.pth")
+                break
+        
+        # Training complete
+        print("\n" + "="*50)
+        print("Training completed!")
+        print(f"Best validation return: {best_val_return:.2f}")
+        print(f"Final epsilon: {agent.epsilon:.3f}")
+        print("="*50 + "\n")
+        
+        # Plot results
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(returns)
+        plt.title("Validation Returns")
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.grid()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(losses)
+        plt.title("Training Loss")
+        plt.xlabel("Episode")
+        plt.ylabel("Loss")
+        plt.grid()
+        
+        plt.tight_layout()
+        plt.savefig("training_results.png")
+        plt.show()
+        
     except Exception as e:
-        print(f"❌ Error loading data: {str(e)}")
-        return
-    
-    # Initialize components
-    print("\nInitializing environment and agent...")
-    env = TradingEnv(train_df)
-    agent = DQNAgent(input_dim=len(Config.tech_indicators), output_dim=2)
-    
-    best_val_return = -np.inf
-    returns = []
-    losses = []
-    
-    print("\n" + "="*50)
-    print("Beginning training loop...")
-    print(f"Total episodes: {Config.num_episodes}")
-    print("="*50 + "\n")
-    
-    for episode in range(Config.num_episodes):
-        state = env.reset()
-        done = False
-        total_reward = 0
-        episode_loss = 0
-        update_count = 0
-        
-        while not done:
-            action = agent.select_action(state)
-            next_state, reward, done, _ = env.step(action)
-            agent.store_transition(state, action, reward, next_state, done)
-            
-            loss = agent.update_model()
-            if loss > 0:
-                episode_loss += loss
-                update_count += 1
-            
-            state = next_state
-            total_reward += reward
-        
-        avg_loss = episode_loss / update_count if update_count > 0 else 0
-        
-        # Validation
-        val_env = TradingEnv(val_df)
-        val_state = val_env.reset()
-        val_done = False
-        val_return = 0
-        
-        with torch.no_grad():
-            while not val_done:
-                val_action = agent.policy_net(val_state).argmax().item()
-                val_state, val_reward, val_done, _ = val_env.step(val_action)
-                val_return += val_reward
-        
-        returns.append(val_return)
-        losses.append(avg_loss)
-        
-        if val_return > best_val_return:
-            best_val_return = val_return
-            torch.save(agent.policy_net.state_dict(), "best_model.pth")
-        
-        if episode % Config.target_update == 0:
-            agent.update_target()
-        
-        print(f"Episode {episode+1:03d}/{Config.num_episodes} | "
-              f"Train: {total_reward:+.2f} | "
-              f"Val: {val_return:+.2f} | "
-              f"ε: {agent.epsilon:.2f} | "
-              f"Loss: {avg_loss:.4f} | "
-              f"Steps: {env.current_step}")
-    
-    # Training complete
-    print("\n" + "="*50)
-    print("Training completed!")
-    print(f"Best validation return: {best_val_return:.2f}")
-    print(f"Final epsilon: {agent.epsilon:.2f}")
-    print("="*50 + "\n")
-    
-    # Plot results
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(returns)
-    plt.title("Validation Returns")
-    plt.xlabel("Episode")
-    plt.ylabel("Return")
-    plt.grid()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(losses)
-    plt.title("Training Loss")
-    plt.xlabel("Episode")
-    plt.ylabel("Loss")
-    plt.grid()
-    
-    plt.tight_layout()
-    plt.savefig("training_results.png")
-    plt.show()
+        print(f"\n❌ Critical error: {str(e)}")
+        if 'agent' in locals():
+            torch.save(agent.policy_net.state_dict(), "error_model.pth")
+        raise
 
 if __name__ == "__main__":
     train()
