@@ -27,7 +27,7 @@ class Config:
     num_episodes = 1000
     
     # Your data paths
-    train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_training.csv"
+    train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"
     val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
     test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
 
