@@ -1,164 +1,193 @@
 import os
-import sys
-import random
-import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from pathlib import Path
+import torch.optim as optim
+import random
+from collections import deque
 import warnings
 warnings.filterwarnings("ignore")
 
-# Set repository root path
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.append(str(REPO_ROOT))
+# Suppress TensorFlow/CUDA warnings if you're not using TF
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# Import from repository modules
-from MacroHFT.model.net import subagent, hyperagent
-from MacroHFT.env.high_level_env import Testing_Env, Training_Env
-from MacroHFT.RL.util.replay_buffer import ReplayBuffer_High
-from MacroHFT.RL.util.memory import episodicmemory
+# ====================== Configuration ======================
+class Config:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = 42
+    lr = 0.001
+    batch_size = 64
+    gamma = 0.99
+    epsilon_start = 1.0
+    epsilon_end = 0.01
+    epsilon_decay = 0.995
+    target_update = 10
+    memory_size = 10000
+    num_episodes = 1000
+    
+    # Your data paths
+    train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_training.csv"
+    val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
+    test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
 
-# Threading configuration
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1" 
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["F_ENABLE_ONEDNN_OPTS"] = "0"
+# ====================== Neural Networks ======================
+class DQN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DQN, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.fc(x)
 
-class LinearDecaySchedule:
-    def __init__(self, start_epsilon, end_epsilon, decay_length):
-        self.start_epsilon = start_epsilon
-        self.end_epsilon = end_epsilon
-        self.decay_length = decay_length
+# ====================== Trading Environment ======================
+class TradingEnv:
+    def __init__(self, df, tech_indicators=['Close'], initial_balance=10000, transaction_cost=0.0002):
+        self.df = df.reset_index(drop=True)
+        self.tech_indicators = tech_indicators
+        self.initial_balance = initial_balance
+        self.transaction_cost = transaction_cost
+        self.action_space = [0, 1]  # 0: hold, 1: buy
+        self.reset()
+        
+    def reset(self):
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.holding = 0
+        self.portfolio_value = [self.initial_balance]
+        return self._get_state()
+    
+    def _get_state(self):
+        state = self.df.loc[self.current_step, self.tech_indicators].values
+        return torch.FloatTensor(state).to(Config.device)
+    
+    def step(self, action):
+        current_price = self.df.loc[self.current_step, 'Close']
+        next_price = self.df.loc[self.current_step + 1, 'Close'] if self.current_step + 1 < len(self.df) else current_price
+        
+        # Execute action
+        if action == 1 and self.holding == 0:  # Buy
+            cost = current_price * (1 + self.transaction_cost)
+            self.holding = self.balance / cost
+            self.balance = 0
+        
+        elif action == 0 and self.holding > 0:  # Sell
+            self.balance = self.holding * current_price * (1 - self.transaction_cost)
+            self.holding = 0
+        
+        # Update portfolio value
+        new_value = self.balance + (self.holding * next_price)
+        reward = np.log(new_value / self.portfolio_value[-1])
+        self.portfolio_value.append(new_value)
+        
+        # Move to next step
+        self.current_step += 1
+        done = self.current_step >= len(self.df) - 1
+        
+        return self._get_state(), reward, done, {}
 
-    def get_epsilon(self, epoch):
-        return max(self.end_epsilon, 
-                 self.start_epsilon - (self.start_epsilon-self.end_epsilon)*epoch/self.decay_length)
-
+# ====================== RL Agent ======================
 class DQNAgent:
-    def __init__(self, args):
-        self.args = args
-        self._setup_device()
-        self._setup_paths()
-        self._load_technical_indicators()
-        self._init_parameters()
-        self._init_networks()
-        self._setup_training()
+    def __init__(self, input_dim, output_dim):
+        self.policy_net = DQN(input_dim, output_dim).to(Config.device)
+        self.target_net = DQN(input_dim, output_dim).to(Config.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.lr)
+        self.memory = deque(maxlen=Config.memory_size)
+        self.epsilon = Config.epsilon_start
+        self.loss_fn = nn.MSELoss()
         
-    def _setup_device(self):
-        self.device = torch.device(self.args.device if torch.cuda.is_available() else "cpu")
-        torch.manual_seed(self.args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.args.seed)
-        np.random.seed(self.args.seed)
-        random.seed(self.args.seed)
+    def select_action(self, state):
+        if random.random() < self.epsilon:
+            return random.choice([0, 1])
+        with torch.no_grad():
+            return self.policy_net(state).argmax().item()
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def update_model(self):
+        if len(self.memory) < Config.batch_size:
+            return
         
-    def _setup_paths(self):
-        self.result_path = REPO_ROOT/'result/high_level'/self.args.dataset/self.args.exp
-        self.model_path = self.result_path/f"seed_{self.args.seed}"
-        self.model_path.mkdir(parents=True, exist_ok=True)
+        batch = random.sample(self.memory, Config.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
         
-        # Data paths - modify these according to your data location
-        self.train_data_path = REPO_ROOT/'data'/self.args.dataset/'whole/df_train.csv'
-        self.val_data_path = REPO_ROOT/'data'/self.args.dataset/'whole/df_validate.csv'
-        self.test_data_path = REPO_ROOT/'data'/self.args.dataset/'whole/df_test.csv'
+        states = torch.stack(states)
+        next_states = torch.stack(next_states)
+        actions = torch.LongTensor(actions).to(Config.device)
+        rewards = torch.FloatTensor(rewards).to(Config.device)
+        dones = torch.FloatTensor(dones).to(Config.device)
         
-    def _load_technical_indicators(self):
-        try:
-            self.tech_indicator_list = np.load(REPO_ROOT/'data/feature_list/single_features.npy', 
-                                             allow_pickle=True).tolist()
-            self.tech_indicator_list_trend = np.load(REPO_ROOT/'data/feature_list/trend_features.npy', 
-                                                   allow_pickle=True).tolist()
-        except FileNotFoundError:
-            self.tech_indicator_list = ['Open', 'High', 'Low', 'Close', 'Volume']
-            self.tech_indicator_list_trend = ['Adj Close']
-            
-        self.clf_list = ['slope_360', 'vol_360']
-        self.n_state_1 = len(self.tech_indicator_list)
-        self.n_state_2 = len(self.tech_indicator_list_trend)
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
+        next_q = self.target_net(next_states).max(1)[0].detach()
+        target_q = rewards + (1 - dones) * Config.gamma * next_q
         
-    def _init_networks(self):
-        # Subagents
-        self.slope_agents = nn.ModuleList([
-            subagent(self.n_state_1, self.n_state_2, 2, 64).to(self.device) 
-            for _ in range(3)
-        ])
-        self.vol_agents = nn.ModuleList([
-            subagent(self.n_state_1, self.n_state_2, 2, 64).to(self.device)
-            for _ in range(3)
-        ])
+        loss = self.loss_fn(current_q.squeeze(), target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
         
-        # Load pretrained models from repo
-        for i in range(3):
-            slope_path = REPO_ROOT/f"result/low_level/{self.args.dataset}/best_model/slope/{i+1}/best_model.pkl"
-            vol_path = REPO_ROOT/f"result/low_level/{self.args.dataset}/best_model/vol/{i+1}/best_model.pkl"
-            
-            if slope_path.exists():
-                self.slope_agents[i].load_state_dict(torch.load(slope_path, map_location=self.device))
-            if vol_path.exists():
-                self.vol_agents[i].load_state_dict(torch.load(vol_path, map_location=self.device))
-        
-        # Hyperagent
-        self.hyperagent = hyperagent(self.n_state_1, self.n_state_2, 2, 32).to(self.device)
-        self.hyperagent_target = hyperagent(self.n_state_1, self.n_state_2, 2, 32).to(self.device)
-        self.hyperagent_target.load_state_dict(self.hyperagent.state_dict())
-        
-    def _setup_training(self):
-        self.optimizer = torch.optim.Adam(self.hyperagent.parameters(), lr=self.args.lr)
-        self.loss_func = nn.MSELoss()
-        self.epsilon_scheduler = LinearDecaySchedule(
-            self.args.epsilon_start, self.args.epsilon_end, self.args.decay_length)
-        self.epsilon = self.args.epsilon_start
-        self.memory = episodicmemory(4320, 5, self.n_state_1, self.n_state_2, 64, self.device)
-        self.replay_buffer = ReplayBuffer_High(self.args, self.n_state_1, self.n_state_2, 2)
-        self.writer = SummaryWriter(self.model_path/"logs")
-        
-    def train(self):
-        best_return = -float('inf')
-        
-        for epoch in range(1, self.args.epoch_number+1):
-            df_train = pd.read_csv(self.train_data_path)
-            env = Training_Env(df_train, 
-                             tech_indicator_list=self.tech_indicator_list,
-                             max_holding_number=self._get_max_holding(),
-                             transcation_cost=self.args.transcation_cost)
-            
-            state = env.reset()
-            done = False
-            
-            while not done:
-                action = self._select_action(state)
-                next_state, reward, done, info = env.step(action)
-                
-                # Store transition and update
-                self._store_transition(state, action, reward, next_state, done, info)
-                if len(self.replay_buffer) > self.args.batch_size:
-                    self._update_networks()
-                
-                state = next_state
-            
-            # Validation and model saving
-            val_return = self._validate()
-            if val_return > best_return:
-                best_return = val_return
-                torch.save(self.hyperagent.state_dict(), self.model_path/"best_model.pkl")
-                
-            self.epsilon = self.epsilon_scheduler.get_epsilon(epoch)
-        
-        self._test()
+        # Decay epsilon
+        self.epsilon = max(Config.epsilon_end, 
+                          self.epsilon * Config.epsilon_decay)
+    
+    def update_target(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    # ... (include all other methods from your original file)
-    # Make sure to update paths to use REPO_ROOT where needed
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    # ... (keep your existing argument parser setup)
-    return parser.parse_args()
+# ====================== Training Loop ======================
+def train():
+    # Load data
+    train_df = pd.read_csv(Config.train_path)
+    val_df = pd.read_csv(Config.val_path)
+    
+    # Initialize
+    env = TradingEnv(train_df)
+    agent = DQNAgent(input_dim=len(env.tech_indicators), output_dim=2)
+    
+    best_val_return = -np.inf
+    
+    for episode in range(Config.num_episodes):
+        state = env.reset()
+        done = False
+        total_reward = 0
+        
+        while not done:
+            action = agent.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            agent.store_transition(state, action, reward, next_state, done)
+            agent.update_model()
+            state = next_state
+            total_reward += reward
+        
+        # Validation
+        val_env = TradingEnv(val_df)
+        val_state = val_env.reset()
+        val_done = False
+        val_return = 0
+        
+        with torch.no_grad():
+            while not val_done:
+                val_action = agent.policy_net(val_state).argmax().item()
+                val_state, val_reward, val_done, _ = val_env.step(val_action)
+                val_return += val_reward
+        
+        # Save best model
+        if val_return > best_val_return:
+            best_val_return = val_return
+            torch.save(agent.policy_net.state_dict(), "best_model.pth")
+        
+        # Update target network
+        if episode % Config.target_update == 0:
+            agent.update_target()
+        
+        print(f"Episode {episode+1}, Total Reward: {total_reward:.2f}, Val Return: {val_return:.2f}, Epsilon: {agent.epsilon:.2f}")
 
 if __name__ == "__main__":
-    args = parse_args()
-    agent = DQNAgent(args)
-    agent.train()
+    train()
