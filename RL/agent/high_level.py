@@ -8,6 +8,7 @@ import random
 from collections import deque
 import matplotlib.pyplot as plt
 import warnings
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
 # Suppress TensorFlow/CUDA warnings
@@ -25,17 +26,16 @@ class Config:
     epsilon_decay = 0.995
     target_update = 10
     memory_size = 10000
-    num_episodes = 500  # Reduced for quicker testing
+    num_episodes = 500
     
-    # Data paths (update these to your actual paths)
+    # Data paths
     train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"
     val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
     test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
     
-    # Technical indicators to use (from your data columns)
     tech_indicators = ['Open', 'High', 'Low', 'Close', 'Volume']
 
-# Set random seeds for reproducibility
+# Set random seeds
 torch.manual_seed(Config.seed)
 np.random.seed(Config.seed)
 random.seed(Config.seed)
@@ -58,15 +58,23 @@ class DQN(nn.Module):
 # ====================== Trading Environment ======================
 class TradingEnv:
     def __init__(self, df, initial_balance=10000, transaction_cost=0.0002):
-        # Process data - ensure numeric values and proper sorting
+        print("\n" + "="*50)
+        print("Debug: Initializing environment...")
+        print(f"Raw data shape: {df.shape}")
+        
+        # Data preprocessing
         self.df = df[Config.tech_indicators].copy()
         self.df = self.df.apply(pd.to_numeric, errors='coerce').dropna()
-        self.dates = df['Date'] if 'Date' in df.columns else None
+        print(f"Clean data shape: {self.df.shape}")
+        print("Sample data points:")
+        print(self.df.head(2))
         
         self.initial_balance = initial_balance
         self.transaction_cost = transaction_cost
-        self.action_space = [0, 1]  # 0: hold, 1: buy
+        self.action_space = [0, 1]
         self.reset()
+        print("Environment initialized successfully!")
+        print("="*50 + "\n")
         
     def reset(self):
         self.current_step = 0
@@ -76,7 +84,6 @@ class TradingEnv:
         return self._get_state()
     
     def _get_state(self):
-        # Ensure numeric values and proper shape
         state = self.df.iloc[self.current_step].values.astype(np.float32)
         return torch.FloatTensor(state).to(Config.device)
     
@@ -88,21 +95,20 @@ class TradingEnv:
         next_price = self.df.iloc[self.current_step + 1]['Close']
         
         # Execute action
-        if action == 1 and self.holding == 0:  # Buy
+        if action == 1 and self.holding == 0:
             cost = current_price * (1 + self.transaction_cost)
             self.holding = self.balance / cost
             self.balance = 0
         
-        elif action == 0 and self.holding > 0:  # Sell
+        elif action == 0 and self.holding > 0:
             self.balance = self.holding * current_price * (1 - self.transaction_cost)
             self.holding = 0
         
-        # Update portfolio value
+        # Update portfolio
         new_value = self.balance + (self.holding * next_price)
         reward = np.log(new_value / self.portfolio_value[-1]) if self.portfolio_value[-1] > 0 else 0
         self.portfolio_value.append(new_value)
         
-        # Move to next step
         self.current_step += 1
         done = self.current_step >= len(self.df) - 1
         
@@ -111,13 +117,15 @@ class TradingEnv:
 # ====================== RL Agent ======================
 class DQNAgent:
     def __init__(self, input_dim, output_dim):
+        print("Initializing DQN agent...")
         self.policy_net = DQN(input_dim, output_dim).to(Config.device)
         self.target_net = DQN(input_dim, output_dim).to(Config.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.lr)
         self.memory = deque(maxlen=Config.memory_size)
         self.epsilon = Config.epsilon_start
-        self.loss_fn = nn.SmoothL1Loss()  # Better for Q-learning than MSE
+        self.loss_fn = nn.SmoothL1Loss()
+        print(f"Agent initialized on {Config.device}")
         
     def select_action(self, state):
         if random.random() < self.epsilon:
@@ -130,7 +138,7 @@ class DQNAgent:
     
     def update_model(self):
         if len(self.memory) < Config.batch_size:
-            return
+            return 0  # Return zero loss when no update happens
         
         batch = random.sample(self.memory, Config.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
@@ -148,41 +156,71 @@ class DQNAgent:
         loss = self.loss_fn(current_q.squeeze(), target_q)
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)  # Gradient clipping
+        nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
         self.optimizer.step()
         
-        # Decay epsilon
         self.epsilon = max(Config.epsilon_end, 
                          self.epsilon * Config.epsilon_decay)
+        return loss.item()
     
     def update_target(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
 # ====================== Training Loop ======================
 def train():
-    # Load and preprocess data
-    train_df = pd.read_csv(Config.train_path)
-    val_df = pd.read_csv(Config.val_path)
+    print("="*50)
+    print("Starting training process...")
+    print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*50 + "\n")
     
-    # Initialize environment and agent
+    # Load data with verification
+    print("Loading training data...")
+    try:
+        train_df = pd.read_csv(Config.train_path)
+        val_df = pd.read_csv(Config.val_path)
+        print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
+        print("\nTraining data sample:")
+        print(train_df.head(2))
+    except Exception as e:
+        print(f"❌ Error loading data: {str(e)}")
+        return
+    
+    # Initialize components
+    print("\nInitializing environment and agent...")
     env = TradingEnv(train_df)
     agent = DQNAgent(input_dim=len(Config.tech_indicators), output_dim=2)
     
     best_val_return = -np.inf
     returns = []
+    losses = []
+    
+    print("\n" + "="*50)
+    print("Beginning training loop...")
+    print(f"Total episodes: {Config.num_episodes}")
+    print("="*50 + "\n")
     
     for episode in range(Config.num_episodes):
         state = env.reset()
         done = False
         total_reward = 0
+        episode_loss = 0
+        update_count = 0
         
         while not done:
             action = agent.select_action(state)
             next_state, reward, done, _ = env.step(action)
             agent.store_transition(state, action, reward, next_state, done)
-            agent.update_model()
+            
+            loss = agent.update_model()
+            if loss > 0:  # Only count actual updates
+                episode_loss += loss
+                update_count += 1
+            
             state = next_state
             total_reward += reward
+        
+        # Calculate average loss
+        avg_loss = episode_loss / update_count if update_count > 0 else 0
         
         # Validation
         val_env = TradingEnv(val_df)
@@ -197,6 +235,7 @@ def train():
                 val_return += val_reward
         
         returns.append(val_return)
+        losses.append(avg_loss)
         
         # Save best model
         if val_return > best_val_return:
@@ -207,19 +246,40 @@ def train():
         if episode % Config.target_update == 0:
             agent.update_target()
         
-        print(f"Episode {episode+1}/{Config.num_episodes} | "
-              f"Train Return: {total_reward:.2f} | "
-              f"Val Return: {val_return:.2f} | "
-              f"Epsilon: {agent.epsilon:.2f}")
+        # Enhanced logging
+        print(f"Episode {episode+1:03d}/{Config.num_episodes} | "
+              f"Train: {total_reward:+.2f} | "
+              f"Val: {val_return:+.2f} | "
+              f"ε: {agent.epsilon:.2f} | "
+              f"Loss: {avg_loss:.4f} | "
+              f"Steps: {env.current_step}")
     
-    # Plot training progress
-    plt.figure(figsize=(10, 5))
+    # Training complete
+    print("\n" + "="*50)
+    print("Training completed!")
+    print(f"Best validation return: {best_val_return:.2f}")
+    print(f"Final epsilon: {agent.epsilon:.2f}")
+    print("="*50 + "\n")
+    
+    # Plot results
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
     plt.plot(returns)
-    plt.title("Validation Returns Over Training")
+    plt.title("Validation Returns")
     plt.xlabel("Episode")
-    plt.ylabel("Cumulative Return")
+    plt.ylabel("Return")
     plt.grid()
-    plt.savefig("training_curve.png")
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(losses)
+    plt.title("Training Loss")
+    plt.xlabel("Episode")
+    plt.ylabel("Loss")
+    plt.grid()
+    
+    plt.tight_layout()
+    plt.savefig("training_results.png")
     plt.show()
 
 if __name__ == "__main__":
