@@ -33,6 +33,10 @@ class Config:
     val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
     test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
     
+    # Dataset limitation (set to None for full dataset)
+    max_train_rows = 100000  # Reduced dataset size for testing
+    max_val_rows = 20000
+    
     tech_indicators = ['Open', 'High', 'Low', 'Close', 'Volume']
 
 # Set random seeds
@@ -138,7 +142,7 @@ class DQNAgent:
     
     def update_model(self):
         if len(self.memory) < Config.batch_size:
-            return 0  # Return zero loss when no update happens
+            return 0
         
         batch = random.sample(self.memory, Config.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
@@ -173,12 +177,19 @@ def train():
     print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*50 + "\n")
     
-    # Load data with verification
+    # Load and limit data
     print("Loading training data...")
     try:
         train_df = pd.read_csv(Config.train_path)
         val_df = pd.read_csv(Config.val_path)
-        print(f"Train shape: {train_df.shape}, Val shape: {val_df.shape}")
+        
+        # Apply dataset limitation
+        if Config.max_train_rows:
+            train_df = train_df.iloc[:Config.max_train_rows]
+        if Config.max_val_rows:
+            val_df = val_df.iloc[:Config.max_val_rows]
+            
+        print(f"Using LIMITED dataset: Train {len(train_df)} rows, Val {len(val_df)} rows")
         print("\nTraining data sample:")
         print(train_df.head(2))
     except Exception as e:
@@ -212,14 +223,13 @@ def train():
             agent.store_transition(state, action, reward, next_state, done)
             
             loss = agent.update_model()
-            if loss > 0:  # Only count actual updates
+            if loss > 0:
                 episode_loss += loss
                 update_count += 1
             
             state = next_state
             total_reward += reward
         
-        # Calculate average loss
         avg_loss = episode_loss / update_count if update_count > 0 else 0
         
         # Validation
@@ -237,16 +247,13 @@ def train():
         returns.append(val_return)
         losses.append(avg_loss)
         
-        # Save best model
         if val_return > best_val_return:
             best_val_return = val_return
             torch.save(agent.policy_net.state_dict(), "best_model.pth")
         
-        # Update target network
         if episode % Config.target_update == 0:
             agent.update_target()
         
-        # Enhanced logging
         print(f"Episode {episode+1:03d}/{Config.num_episodes} | "
               f"Train: {total_reward:+.2f} | "
               f"Val: {val_return:+.2f} | "
@@ -263,7 +270,6 @@ def train():
     
     # Plot results
     plt.figure(figsize=(12, 5))
-    
     plt.subplot(1, 2, 1)
     plt.plot(returns)
     plt.title("Validation Returns")
